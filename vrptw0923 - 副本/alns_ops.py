@@ -4,6 +4,7 @@ from collections import defaultdict
 import random
 import math
 from functools import lru_cache
+from typing import List, Tuple
 from scipy.spatial.distance import pdist, squareform
 from vrptw_instance import VRPTWInstance
 from decoder import VRPTWDecoder
@@ -21,7 +22,9 @@ class AlnsOperators:
         self.service_times = np.array([c['service_time'] for c in all_nodes_data])
 
         self.vehicle_capacity = instance.vehicle_info['capacity']
+        self.vehicle_limit = int(instance.vehicle_info.get('number', max(1, math.ceil(len(instance.ordinary_customers) / max(1, instance.vehicle_info['capacity'])))))
         self.dist_matrix = instance.distance_matrix
+        self._metric_weight = float(self.dist_matrix.max() + 1.0)
 
         # Shaw Removal relatedness
         self.relatedness_weights = np.array([9, 3, 2, 5, 0.5])
@@ -66,6 +69,52 @@ class AlnsOperators:
             return True
         return False
 
+    def _metric_key(self, metric: Tuple[int, float]) -> float:
+        """把(车辆数, 距离)映射为便于比较的标量。"""
+        return metric[0] * (self._metric_weight ** 2) + metric[1]
+
+    def _candidate_positions(self, chromosome: List[int], customer: int, max_positions: int = 40) -> List[int]:
+        if not chromosome:
+            return [0]
+
+        candidate_positions = set()
+        neighbors = set(self._neighbor_lists[customer][:max_positions])
+        for idx, node in enumerate(chromosome):
+            if node in neighbors:
+                candidate_positions.add(idx)
+                candidate_positions.add(idx + 1)
+
+        if not candidate_positions:
+            step = max(1, len(chromosome) // max(1, max_positions // 2))
+            candidate_positions.update(range(0, len(chromosome) + 1, step))
+
+        candidate_positions.add(0)
+        candidate_positions.add(len(chromosome))
+        return sorted(min(pos, len(chromosome)) for pos in candidate_positions)
+
+    def _route_schedule(self, route: List[int]) -> List[dict]:
+        schedule = []
+        current_pos = 0
+        current_time = 0.0
+        for cust in route:
+            travel = float(self.dist_matrix[current_pos, cust + 1])
+            arrival = current_time + travel
+            ready, due = self.time_windows[cust + 1]
+            start = max(arrival, ready)
+            slack = max(0.0, due - start)
+            window = max(1.0, due - ready)
+            schedule.append({
+                'customer': cust,
+                'arrival': arrival,
+                'start': start,
+                'slack': slack,
+                'window': window
+            })
+            service = float(self.service_times[cust + 1])
+            current_time = start + service
+            current_pos = cust + 1
+        return schedule
+
     def _route_distance(self, route: list[int]) -> float:
         """计算单条路径的总距离 (包含往返仓库)"""
         dist = 0.0
@@ -77,108 +126,151 @@ class AlnsOperators:
         return dist
 
     def greedy_repair(self, destroyed_chromosome: list[int], removed_customers: list[int], K: int = 30) -> list[int]:
-        """
-        贪心修复算子.
-
-        Args:
-            destroyed_chromosome: 破坏后的染色体.
-            removed_customers: 被移除的客户列表.
-            K: 每次插入时评估的最佳位置数量.
-
-        Returns:
-            修复后的染色体.
-        """
-        chromosome = destroyed_chromosome[:]
-        
-        for cust in removed_customers:
-            best_pos = -1
-            best_cost = float('inf')
-            
-            # 寻找最佳插入位置
-            for pos in range(len(chromosome) + 1):
-                temp_chrom = chromosome[:pos] + [cust] + chromosome[pos:]
-                res = self.decoder.decode_solution(temp_chrom, strategy='fast')
-                if res['feasible']:
-                    cost = (res['vehicle_count'], res['total_distance'])
-                    if self._lex_better(cost, (99, best_cost)):
-                        best_cost = cost[1]
-                        best_pos = pos
-
-            if best_pos != -1:
-                chromosome.insert(best_pos, cust)
-            else:
-                # 如果找不到可行位置，则追加到末尾 (可能导致解不可行)
-                chromosome.append(cust)
-                
-        return chromosome
+        """车辆优先的贪心修复算子。"""
+        return self.vehicle_first_repair(destroyed_chromosome, removed_customers, max_positions=K)
 
     def regret_insertion(self, destroyed_chromosome: list[int], removed_customers: list[int], k: int = 3, positions_per_node: int = 40, fallback_greedy: bool = True) -> list[int]:
-        """
-        Regret-k 修复算子.
+        """车辆优先的 Regret-k 修复算子。"""
+        result = self.lexicographic_regret_insertion(destroyed_chromosome, removed_customers, k=k, max_positions=positions_per_node)
+        if fallback_greedy and any(c not in result for c in destroyed_chromosome):
+            # 防御性检查：若有客户丢失，则回退
+            return self.vehicle_first_repair(destroyed_chromosome, removed_customers, max_positions=positions_per_node)
+        return result
 
-        Args:
-            destroyed_chromosome: 破坏后的染色体.
-            removed_customers: 被移除的客户列表.
-            k: Regret值计算中考虑的最佳插入位置数量.
-            positions_per_node: 为每个客户评估的最大插入位置数.
-            fallback_greedy: 如果失败，是否回退到贪心修复.
+    def vehicle_first_repair(self, destroyed_chromosome: List[int], removed_customers: List[int], max_positions: int = 40) -> List[int]:
+        chromosome = destroyed_chromosome[:]
+        remaining = removed_customers[:]
 
-        Returns:
-            修复后的染色体.
-        """
+        while remaining:
+            best_choice = None
+            best_metric = None
+
+            for cust in remaining:
+                candidate_positions = self._candidate_positions(chromosome, cust, max_positions=max_positions)
+                for pos in candidate_positions:
+                    candidate = chromosome[:pos] + [cust] + chromosome[pos:]
+                    res = self.decoder.decode_solution(candidate, strategy='fast')
+                    if not res['feasible']:
+                        continue
+                    metric = (res['vehicle_count'], res['total_distance'])
+                    if best_metric is None or self._lex_better(metric, best_metric):
+                        best_metric = metric
+                        best_choice = (cust, candidate)
+
+            if best_choice is None:
+                chromosome.append(remaining.pop(0))
+            else:
+                cust, candidate = best_choice
+                chromosome = candidate
+                remaining.remove(cust)
+
+        return chromosome
+
+    def lexicographic_regret_insertion(self, destroyed_chromosome: List[int], removed_customers: List[int], k: int = 3, max_positions: int = 40) -> List[int]:
         chromosome = destroyed_chromosome[:]
         unassigned = removed_customers[:]
-        
+
         while unassigned:
-            best_cust = -1
+            best_cust = None
+            best_option = None
             max_regret = -float('inf')
-            
-            # 为每个未分配的客户计算regret值
+
             for cust in unassigned:
-                costs = []
-                # 评估插入成本
-                for pos in range(len(chromosome) + 1):
-                    temp_chrom = chromosome[:pos] + [cust] + chromosome[pos:]
-                    res = self.decoder.decode_solution(temp_chrom, strategy='fast')
-                    if res['feasible']:
-                        costs.append(res['total_distance'])
-                
-                if not costs:
+                candidate_positions = self._candidate_positions(chromosome, cust, max_positions=max_positions)
+                scored: List[Tuple[Tuple[int, float], List[int]]] = []
+                for pos in candidate_positions:
+                    candidate = chromosome[:pos] + [cust] + chromosome[pos:]
+                    res = self.decoder.decode_solution(candidate, strategy='fast')
+                    if not res['feasible']:
+                        continue
+                    metric = (res['vehicle_count'], res['total_distance'])
+                    scored.append((metric, candidate))
+
+                if not scored:
                     continue
 
-                costs.sort()
-                regret = sum(costs[i] - costs[0] for i in range(1, min(k, len(costs))))
-                
-                if regret > max_regret:
-                    max_regret = regret
-                    best_cust = cust
+                scored.sort(key=lambda item: (item[0][0], item[0][1]))
+                best_metric = scored[0][0]
+                regret_value = 0.0
+                for alt_metric, _ in scored[1: min(k, len(scored))]:
+                    regret_value += self._metric_key(alt_metric) - self._metric_key(best_metric)
 
-            if best_cust != -1:
-                # 插入具有最大regret值的客户
-                best_pos = -1
-                min_cost = float('inf')
-                for pos in range(len(chromosome) + 1):
-                    temp_chrom = chromosome[:pos] + [best_cust] + chromosome[pos:]
-                    res = self.decoder.decode_solution(temp_chrom, strategy='fast')
-                    if res['feasible'] and res['total_distance'] < min_cost:
-                        min_cost = res['total_distance']
-                        best_pos = pos
-                
-                if best_pos != -1:
-                    chromosome.insert(best_pos, best_cust)
-                    unassigned.remove(best_cust)
-                else:
-                    # 如果找不到位置，则停止
-                    break
-            else:
-                # 如果没有客户可以插入，则停止
+                if regret_value > max_regret:
+                    max_regret = regret_value
+                    best_cust = cust
+                    best_option = scored[0][1]
+
+            if best_cust is None or best_option is None:
+                chromosome.extend(unassigned)
                 break
 
-        # 如果仍有未分配的客户，使用贪心修复
-        if unassigned and fallback_greedy:
-            chromosome = self.greedy_repair(chromosome, unassigned)
-            
+            chromosome = best_option
+            unassigned.remove(best_cust)
+
         return chromosome
+
+    def random_customer_removal(self, chromosome: List[int], intensity: float = 0.12) -> Tuple[List[int], List[int]]:
+        if not chromosome:
+            return chromosome[:], []
+        remove_count = max(1, int(len(chromosome) * intensity))
+        return self.random_removal(chromosome, remove_count)
+
+    def time_window_removal(self, chromosome: List[int], intensity: float = 0.12) -> Tuple[List[int], List[int]]:
+        if not chromosome:
+            return chromosome[:], []
+
+        solution = self.decoder.decode_solution(chromosome, strategy='detailed')
+        candidates = []
+        for route in solution.get('routes', []):
+            customers = route.get('customers', [])
+            if not customers:
+                continue
+            schedule = self._route_schedule(customers)
+            load_ratio = min(1.0, route.get('load', 0.0) / max(1e-6, self.vehicle_capacity))
+            for item in schedule:
+                slack_ratio = 1.0 - min(1.0, item['slack'] / item['window'])
+                score = 0.6 * slack_ratio + 0.4 * load_ratio
+                candidates.append((score, item['customer']))
+
+        if not candidates:
+            return self.random_customer_removal(chromosome, intensity)
+
+        candidates.sort(reverse=True)
+        remove_count = max(1, int(len(chromosome) * intensity))
+        selected = [cust for _, cust in candidates[:remove_count]]
+        new_chromosome = [cust for cust in chromosome if cust not in selected]
+        return new_chromosome, selected
+
+    def load_balanced_route_removal(self, chromosome: List[int], min_routes: int = 1) -> Tuple[List[int], List[int]]:
+        if not chromosome:
+            return chromosome[:], []
+
+        solution = self.decoder.decode_solution(chromosome, strategy='detailed')
+        route_scores = []
+        for route in solution.get('routes', []):
+            customers = route.get('customers', [])
+            if not customers:
+                continue
+            load_ratio = route.get('load', 0.0) / max(1e-6, self.vehicle_capacity)
+            schedule = self._route_schedule(customers)
+            if schedule:
+                slack_ratios = [min(1.0, item['slack'] / item['window']) for item in schedule]
+                avg_slack = sum(slack_ratios) / len(slack_ratios)
+            else:
+                avg_slack = 1.0
+            score = 0.7 * load_ratio + 0.3 * (1.0 - avg_slack)
+            route_scores.append((score, customers))
+
+        if not route_scores:
+            return chromosome[:], []
+
+        route_scores.sort()
+        removed = []
+        for _, customers in route_scores[:max(1, min_routes)]:
+            removed.extend(customers)
+
+        new_chromosome = [cust for cust in chromosome if cust not in removed]
+        return new_chromosome, removed
 
     def random_removal(self, chromosome: list[int], remove_count: int) -> tuple[list[int], list[int]]:
         """
@@ -412,6 +504,44 @@ class AlnsOperators:
 
         new_chromosome = [c for c in chromosome if c not in removed_customers]
         return new_chromosome, removed_customers
+
+    def vehicle_first_global_search(self, chromosome: List[int]) -> List[int]:
+        if not chromosome:
+            return chromosome
+
+        base_metric = self._solution_to_metric(chromosome)
+        solution = self.decoder.decode_solution(chromosome, strategy='detailed')
+        routes = solution.get('routes', [])
+        if len(routes) <= 1:
+            return chromosome
+
+        route_scores = []
+        for route in routes:
+            customers = route.get('customers', [])
+            if not customers:
+                continue
+            load_ratio = route.get('load', 0.0) / max(1e-6, self.vehicle_capacity)
+            schedule = self._route_schedule(customers)
+            if schedule:
+                slack_ratios = [min(1.0, item['slack'] / item['window']) for item in schedule]
+                avg_slack = sum(slack_ratios) / len(slack_ratios)
+            else:
+                avg_slack = 1.0
+            score = 0.7 * load_ratio + 0.3 * (1.0 - avg_slack)
+            route_scores.append((score, customers))
+
+        if not route_scores:
+            return chromosome
+
+        route_scores.sort()
+        candidate_customers = route_scores[0][1]
+        remaining = [cust for cust in chromosome if cust not in candidate_customers]
+        rebuilt = self.vehicle_first_repair(remaining, candidate_customers)
+        rebuilt_metric = self._solution_to_metric(rebuilt)
+
+        if self._lex_better(rebuilt_metric, base_metric):
+            return rebuilt
+        return chromosome
 
     def _two_opt_route(self, route: list[int], max_swaps: int = 60) -> list[int]:
         """对单条路径执行2-opt局部搜索"""
