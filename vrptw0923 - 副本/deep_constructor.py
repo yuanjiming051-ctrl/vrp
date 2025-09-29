@@ -162,50 +162,59 @@ class DeepConstructor:
         }
 
         for route in self.VC_new:
+            if not route:
+                continue
+
             xs = [self.cust[i]['xcoord'] for i in route]
             ys = [self.cust[i]['ycoord'] for i in route]
             ds = [self.cust[i]['demand'] for i in route]
-            sts = [self.cust[i]['service_time'] for i in route]
             rn = len(route)
 
-            # 计算聚合后的时间窗参数
-            if rn == 1:
-                # 单个客户的情况
-                i = route[0]
-                ready_time = self.cust[i]['ready_time']
-                due_date = self.cust[i]['due_date']
-                service_time = self.cust[i]['service_time']
-            else:
-                # 多个客户聚合的情况
-                first_customer = route[0]
-                second_customer = route[1]
-                
-                # 1. 开始时间 = 第一个客户的ReadyTime
-                ready_time = self.cust[first_customer]['ready_time']
-                
-                # 2. 截止时间 = 第二个客户的截止时间 - 第一个客户到第二个客户的距离
-                travel_time_1_to_2 = self.D[first_customer+1, second_customer+1]
-                due_date = self.cust[second_customer]['due_date'] - travel_time_1_to_2
-                
-                # 3. 服务时间 = 完成整个子路径所需的总时间
-                # 包括所有客户的服务时间 + 客户间的行驶时间
-                service_time = 0
-                for j in range(rn):
-                    customer_idx = route[j]
-                    service_time += self.cust[customer_idx]['service_time']
-                    
-                    # 添加到下一个客户的行驶时间
-                    if j < rn - 1:
-                        next_customer_idx = route[j + 1]
-                        service_time += self.D[customer_idx+1, next_customer_idx+1]
+            # 使用需求加权质心表示聚合节点的空间位置
+            demand_sum = max(1e-6, float(sum(ds)))
+            weights = [d / demand_sum for d in ds]
+            centroid_x = float(sum(w * x for w, x in zip(weights, xs)))
+            centroid_y = float(sum(w * y for w, y in zip(weights, ys)))
+
+            # 计算内部服务时间（访问聚合节点内部所有客户的服务+行驶时间）
+            service_time = 0.0
+            for idx, customer_idx in enumerate(route):
+                service_time += float(self.cust[customer_idx]['service_time'])
+                if idx < rn - 1:
+                    nxt = route[idx + 1]
+                    service_time += float(self.D[customer_idx + 1, nxt + 1])
+
+            # 计算前向累计时间，用于估计可行的出发时间窗口
+            prefix_travel = []
+            cumulative = float(self.D[0, route[0] + 1])
+            prefix_travel.append(cumulative)
+            for idx in range(1, rn):
+                prev = route[idx - 1]
+                curr = route[idx]
+                cumulative += float(self.cust[prev]['service_time'])
+                cumulative += float(self.D[prev + 1, curr + 1])
+                prefix_travel.append(cumulative)
+
+            ready_candidates = []
+            due_candidates = []
+            for offset, customer_idx in zip(prefix_travel, route):
+                ready = float(self.cust[customer_idx]['ready_time'])
+                due = float(self.cust[customer_idx]['due_date'])
+                ready_candidates.append(ready - offset)
+                due_candidates.append(due - offset)
+
+            ready_time = max(0.0, max(ready_candidates)) if ready_candidates else 0.0
+            due_time = min(due_candidates) if due_candidates else ready_time + service_time
+            if due_time < ready_time:
+                due_time = ready_time + max(1.0, service_time)
 
             deepdata['customer'].append({
-                'x': np.mean(xs),
-                'y': np.mean(ys),
-                'demand': sum(ds),
+                'x': centroid_x,
+                'y': centroid_y,
+                'demand': demand_sum,
                 'ServiceTime': service_time,
                 'ReadyTime': ready_time,
-                'DueDate': due_date
+                'DueDate': due_time
             })
 
         return deepdata

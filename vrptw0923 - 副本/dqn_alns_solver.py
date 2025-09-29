@@ -67,26 +67,39 @@ class DQNALNSSolver:
 
         self.alns_ops = AlnsOperators(instance, random)
 
+        def _named(func, name):
+            func.__name__ = name
+            return func
+
+        def full_random_destroy(chrom):
+            return self.alns_ops.random_customer_removal(chrom, intensity=0.15)
+
+        def full_timewindow_destroy(chrom):
+            return self.alns_ops.time_window_removal(chrom, intensity=0.18)
+
+        def full_route_destroy(chrom):
+            return self.alns_ops.load_balanced_route_removal(chrom, min_routes=1)
+
         self.destroy_ops_full = [
-            lambda chrom: self.alns_ops.random_removal(chrom, max(5, len(chrom) // 12)),
-            # lambda chrom: self.alns_ops.worst_removal(chrom, max(5, len(chrom) // 15), sample_frac=0.30),
-            lambda chrom: self.alns_ops.shaw_removal(chrom, max(5, len(chrom) // 15))
+            _named(full_random_destroy, "full_random_destroy"),
+            _named(full_timewindow_destroy, "full_timewindow_destroy"),
+            _named(full_route_destroy, "full_route_destroy")
         ]
 
-        # 初始化 destroy_ops_deep，使用相同的操作符但参数适配深度空间（优化：增加移除数量）
-        self.destroy_ops_deep = [
-            lambda chrom: self.alns_ops.random_removal(chrom, max(2, len(chrom) // 8)),  # 从1/20增加到1/8
-            lambda chrom: self.alns_ops.shaw_removal(chrom, max(2, len(chrom) // 6)),    # 从1/15增加到1/6
-            lambda chrom: self.alns_ops.complete_route_removal(chrom, target_routes=1)   # 使用完整路径移除操作
-        ]
+        # 深度空间的破坏算子稍后在构造深度实例后设置
+        self.destroy_ops_deep = []
 
-        # 修复操作需要考虑是否在Deep空间执行
+        def repair_vehicle_first(destroyed, removed, inst):
+            ops = self.alns_ops_deep if inst is self.deep_inst else self.alns_ops
+            return ops.vehicle_first_repair(destroyed, removed)
+
+        def repair_regret(destroyed, removed, inst):
+            ops = self.alns_ops_deep if inst is self.deep_inst else self.alns_ops
+            return ops.lexicographic_regret_insertion(destroyed, removed, k=2)
+
         self.repair_ops = [
-            # 当传入inst参数时，使用专门的Deep空间修复逻辑
-            lambda destroyed, removed, inst: self._repair_in_space(destroyed, removed, inst, 
-                                                                  lambda d, r: self.alns_ops.greedy_repair(d, r)),
-            lambda destroyed, removed, inst: self._repair_in_space(destroyed, removed, inst, 
-                                                                  lambda d, r: self.alns_ops.regret_insertion(d, r, k=2))
+            _named(repair_vehicle_first, "vehicle_first_repair"),
+            _named(repair_regret, "lexicographic_regret")
         ]
 
         self.action_size = len(self.destroy_ops_full) * len(self.repair_ops)
@@ -199,6 +212,22 @@ class DQNALNSSolver:
         self.Nd = len(deepdata['customer'])
         self.deep_inst = DeepVRPTWInstance(deepdata)
         self.init_gen_deep = InitialSolutionGenerator(self.deep_inst)
+        self.alns_ops_deep = AlnsOperators(self.deep_inst, random)
+
+        def deep_random_destroy(chrom):
+            return self.alns_ops_deep.random_customer_removal(chrom, intensity=0.25)
+
+        def deep_timewindow_destroy(chrom):
+            return self.alns_ops_deep.time_window_removal(chrom, intensity=0.25)
+
+        def deep_route_destroy(chrom):
+            return self.alns_ops_deep.load_balanced_route_removal(chrom, min_routes=1)
+
+        self.destroy_ops_deep = [
+            _named(deep_random_destroy, "deep_random_destroy"),
+            _named(deep_timewindow_destroy, "deep_timewindow_destroy"),
+            _named(deep_route_destroy, "deep_route_destroy")
+        ]
 
         # 7.1) 构造 cluster_label 数组（原客户数 -> 深度节点索引）
         n_customers = len(self.instance.ordinary_customers)
@@ -293,8 +322,8 @@ class DQNALNSSolver:
         # ===============================
 
         start_time = time.time()
-        ten_minutes = 10 * 6000
-        thirty_minutes = 30 * 6000
+        ten_minutes = 10 * 60
+        thirty_minutes = 30 * 60
 
         # 记录 10 分钟和 30 分钟时的数据
         ten_minute_data = None
@@ -321,7 +350,7 @@ class DQNALNSSolver:
         # ===============================
         # 2) 种群协同进化循环（共 deep_iters 轮）
         # ===============================
-        for round_idx in range(1, 1000 + 1):
+        for round_idx in range(1, self.iters + 1):
             elapsed_time = time.time() - start_time
 
             # 检查是否超过 30 分钟
@@ -488,25 +517,18 @@ class DQNALNSSolver:
             for k in range(self.pop_size):
                 full_from_deep = map_deep_to_full(pop_deep[k], vc_map)
                 cost_full_from_deep = self._evaluate_full(full_from_deep)
-                
+
                 if self.verbose:
                     print(f"    个体 {k}: Deep序列 {pop_deep[k]} -> Full序列长度 {len(full_from_deep)}, 成本 {cost_full_from_deep:.2f}")
 
                 # 多样性保护：除了第一轮外，避免产生重复的最小值
                 updated = False
-                if round_idx == 1:
-                    # 第一轮允许任何改进
-                    if cost_full_from_deep < pop_full_cost[k]:
-                        pop_full[k] = full_from_deep
-                        pop_full_cost[k] = cost_full_from_deep
-                        updated = True
-                else:
-                    # 后续轮次：只有严格小于当前种群最小值时才允许更新
-                    current_min_cost = min(pop_full_cost)
-                    if cost_full_from_deep < pop_full_cost[k] and cost_full_from_deep < current_min_cost:
-                        pop_full[k] = full_from_deep
-                        pop_full_cost[k] = cost_full_from_deep
-                        updated = True
+                current_min_cost = min(pop_full_cost)
+                if self._should_accept_improvement(pop_full_cost[k], cost_full_from_deep,
+                                                    current_min_cost, round_idx):
+                    pop_full[k] = full_from_deep
+                    pop_full_cost[k] = cost_full_from_deep
+                    updated = True
                 
                 if updated:
                     deep_to_full_updates += 1
@@ -571,12 +593,15 @@ class DQNALNSSolver:
                     res = self.decoder.decode_solution(curr_full, strategy='fast')
                     total_d = res['total_distance']  # 总距离
                     veh_cnt = res['vehicle_count']  # 车辆数
-                    worst_d = min(len(r['customers']) for r in res['routes'])  # 节点数最少的路径
+                    routes = res.get('routes', [])
+                    worst_route_len = max((len(r.get('customers', [])) for r in routes), default=0)
 
+                    customer_count = max(1, len(self.instance.ordinary_customers))
+                    vehicle_limit = max(1, self.instance.vehicle_info.get('number', veh_cnt))
                     global_feat = torch.tensor([
                         total_d / 1e4,
-                        veh_cnt / len(res['routes']),
-                        worst_d / 1e3
+                        veh_cnt / vehicle_limit,
+                        worst_route_len / customer_count
                     ], dtype=torch.float, device=device)
                     state_emb = torch.cat([emb, global_feat], dim=-1)  # (embed_dim+3,)
                     q_vals = self.agent_full.qnetwork_local(state_emb.unsqueeze(0)).squeeze(0)  # (action_size,)
@@ -603,6 +628,8 @@ class DQNALNSSolver:
                         new_full = [int(x) for x in new_full]
                     except Exception:
                         pass
+                    # 全局车辆优先搜索增强
+                    new_full = self.alns_ops.vehicle_first_global_search(new_full)
                     # 避免重复解码，这里先不计算 new_full_cost，稍后从 fast 解码结果赋值
                     new_full_cost = None
 
@@ -616,18 +643,19 @@ class DQNALNSSolver:
                     res2 = self.decoder.decode_solution(new_full, strategy='fast')
                     total2 = res2['total_distance']
                     veh2 = res2['vehicle_count']
-                    worst2 = max(r['distance'] for r in res2['routes'])
+                    next_routes = res2.get('routes', [])
+                    next_worst_route_len = max((len(r.get('customers', [])) for r in next_routes), default=0)
 
                     # 6.2) 计算奖励（距离改进 + 车辆数减少 + 最差路径缩短），并设置 new_full_cost
                     new_full_cost = total2
                     dist_gain = curr_full_cost - new_full_cost
                     veh_gain = float(veh_cnt - veh2)
-                    worst_gain = float(worst_d - worst2)
+                    worst_gain = float(worst_route_len - next_worst_route_len)
                     reward = dist_gain + 1000.0 * veh_gain + 0.1 * worst_gain
                     global2 = torch.tensor([
                         total2 / 1e4,
-                        veh2 / len(res2['routes']),
-                        worst2 / 1e3
+                        veh2 / vehicle_limit,
+                        next_worst_route_len / customer_count
                     ], dtype=torch.float, device=device)
 
                     next_state_emb = torch.cat([next_emb, global2], dim=-1)  # (embed_dim+3,)
@@ -746,19 +774,8 @@ class DQNALNSSolver:
                         # 如果局部搜索找到更好的解，则更新（带多样性保护）
                         if improved_cost < pop_full_cost[k]:
                             current_min_cost = min(pop_full_cost)
-                            # 改进的多样性保护逻辑：
-                            # 1. 如果找到更好的全局最优解，总是更新
-                            # 2. 如果改进幅度足够大（超过1%），允许更新
-                            # 3. 如果是第一轮，允许更新
-                            # 4. 如果当前个体不是最优个体，允许适度改进
-                            improvement_ratio = (pop_full_cost[k] - improved_cost) / pop_full_cost[k]
-                            is_significant_improvement = improvement_ratio > 0.01  # 改进超过1%
-                            is_not_best_individual = pop_full_cost[k] > current_min_cost * 1.05  # 当前个体不是接近最优的
-
-                            if (improved_cost < current_min_cost or  # 找到更好的全局最优解
-                                    round_idx == 1 or  # 第一轮
-                                    is_significant_improvement or  # 显著改进
-                                    is_not_best_individual):  # 非最优个体的适度改进
+                            if self._should_accept_improvement(pop_full_cost[k], improved_cost,
+                                                                current_min_cost, round_idx):
                                 old_cost = pop_full_cost[k]
                                 pop_full[k] = improved_solution
                                 pop_full_cost[k] = improved_cost
@@ -948,12 +965,25 @@ class DQNALNSSolver:
             self.deep_inst = DeepVRPTWInstance(deepdata)
             self.Nd = len(deepdata['customer'])
             self.init_gen_deep = InitialSolutionGenerator(self.deep_inst)
-            # 更新destroy_ops_deep以使用新的deep_inst（优化：增加移除数量和操作多样性）
-            # 使用现有的ALNS操作符，适配深度空间的参数
+            self.alns_ops_deep = AlnsOperators(self.deep_inst, random)
+
+            def deep_random_destroy(chrom):
+                return self.alns_ops_deep.random_customer_removal(chrom, intensity=0.25)
+
+            def deep_timewindow_destroy(chrom):
+                return self.alns_ops_deep.time_window_removal(chrom, intensity=0.25)
+
+            def deep_route_destroy(chrom):
+                return self.alns_ops_deep.load_balanced_route_removal(chrom, min_routes=1)
+
+            deep_random_destroy.__name__ = "deep_random_destroy"
+            deep_timewindow_destroy.__name__ = "deep_timewindow_destroy"
+            deep_route_destroy.__name__ = "deep_route_destroy"
+
             self.destroy_ops_deep = [
-                lambda chrom: self.alns_ops.random_removal(chrom, max(2, len(chrom) // 4)),  # 从1/5增加到1/4
-                lambda chrom: self.alns_ops.shaw_removal(chrom, max(2, len(chrom) // 4)),    # 从1/5增加到1/4
-                lambda chrom: self.alns_ops.complete_route_removal(chrom, target_routes=1)   # 使用完整路径移除操作
+                deep_random_destroy,
+                deep_timewindow_destroy,
+                deep_route_destroy
             ]
             self.current_VC_new = groups
             self.current_group_id = {c: i for i, g in enumerate(groups) for c in g}
@@ -1170,10 +1200,10 @@ class DQNALNSSolver:
         """计算种群多样性"""
         if len(population) < 2:
             return 1.0
-        
+
         total_distance = 0
         count = 0
-        
+
         for i in range(len(population)):
             for j in range(i + 1, len(population)):
                 # 计算两个解之间的汉明距离（不同位置的比例）
@@ -1183,8 +1213,49 @@ class DQNALNSSolver:
                     distance = diff_count / len(seq1)
                     total_distance += distance
                     count += 1
-        
+
         return total_distance / count if count > 0 else 0.0
+
+    def _should_accept_improvement(self, current_cost: float, candidate_cost: float,
+                                   best_cost: float, round_idx: int,
+                                   min_improvement_ratio: float = 0.005) -> bool:
+        """
+        判断在保持多样性的前提下是否接受改进解。
+
+        Args:
+            current_cost: 当前个体的成本。
+            candidate_cost: 候选改进解的成本。
+            best_cost: 种群当前的最优成本。
+            round_idx: 当前迭代轮次。
+            min_improvement_ratio: 允许接受的最小相对改进幅度。
+
+        Returns:
+            bool: 是否接受候选解。
+        """
+        if candidate_cost + 1e-6 >= current_cost:
+            return False
+
+        # 始终接受全局最优或首轮改进
+        if candidate_cost + 1e-6 < best_cost:
+            return True
+        if round_idx == 1:
+            return True
+
+        improvement = current_cost - candidate_cost
+        if current_cost > 0:
+            improvement_ratio = improvement / current_cost
+        else:
+            improvement_ratio = float('inf')
+
+        if improvement_ratio >= min_improvement_ratio:
+            return True
+
+        # 如果当前个体明显劣于全局最优（按多样性阈值），也允许改进
+        tolerance = max(0.01, self.diversity_threshold)
+        if current_cost > best_cost * (1 + tolerance):
+            return True
+
+        return False
 
     def _restart_population(self, pop_full, pop_full_cost, pop_deep, pop_deep_cost):
         """重启种群，保留精英个体"""
