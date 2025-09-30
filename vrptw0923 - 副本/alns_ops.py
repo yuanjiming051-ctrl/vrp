@@ -4,6 +4,7 @@ from collections import defaultdict
 import random
 import math
 from functools import lru_cache
+from typing import Dict, List, Optional, Set, Tuple
 from scipy.spatial.distance import pdist, squareform
 from vrptw_instance import VRPTWInstance
 from decoder import VRPTWDecoder
@@ -19,6 +20,10 @@ class AlnsOperators:
         self.demands = np.array([c['demand'] for c in all_nodes_data])
         self.time_windows = np.array([[c['ready_time'], c['due_date']] for c in all_nodes_data])
         self.service_times = np.array([c['service_time'] for c in all_nodes_data])
+
+        # 建立客户编号和索引之间的映射，兼容0-based索引和原始cust_no编号
+        self.index_to_cust_no = [cust['cust_no'] for cust in instance.ordinary_customers]
+        self.cust_no_to_index = {cust_no: idx for idx, cust_no in enumerate(self.index_to_cust_no)}
 
         self.vehicle_capacity = instance.vehicle_info['capacity']
         self.dist_matrix = instance.distance_matrix
@@ -46,10 +51,135 @@ class AlnsOperators:
         self.decoder = VRPTWDecoder(instance)
         
         # 预计算邻居列表
-        self._neighbor_lists = [
-            np.argsort(self.dist_matrix[i + 1, 1:])[:20].tolist()
-            for i in range(self.num_customers)
-        ]
+        # 预计算每个客户的邻居列表（使用0-based客户索引）
+        self._neighbor_lists = [[] for _ in range(self.num_customers)]
+        if self.dist_matrix is not None:
+            for cust_idx in range(self.num_customers):
+                # 跳过仓库列，仅保留客户之间的距离
+                row = self.dist_matrix[cust_idx + 1, 1:]
+                neighbor_order = np.argsort(row)
+
+                neighbors = []
+                for neighbor_idx in neighbor_order:
+                    if neighbor_idx == cust_idx:
+                        continue  # 跳过自身
+                    neighbors.append(int(neighbor_idx))
+                    if len(neighbors) >= 20:
+                        break
+
+                self._neighbor_lists[cust_idx] = neighbors
+
+    def _normalize_customer_index(self, customer: int) -> Tuple[Optional[int], bool]:
+        """将外部客户标识转换为内部0-based索引。
+
+        返回 (索引, 是否使用原始cust_no编号)。
+        """
+        if 0 <= customer < self.num_customers:
+            return customer, False
+        mapped = self.cust_no_to_index.get(customer)
+        if mapped is not None:
+            return mapped, True
+        return None, False
+
+    def _neighbor_candidates(self, customer: int, limit: Optional[int] = None) -> list[int]:
+        """获取与给定客户相邻的候选客户列表，保持输入编号风格。"""
+        norm_idx, used_cust_no = self._normalize_customer_index(customer)
+        if norm_idx is None or norm_idx >= len(self._neighbor_lists):
+            return []
+
+        neighbors = self._neighbor_lists[norm_idx]
+        if limit is not None:
+            neighbors = neighbors[:limit]
+
+        if used_cust_no:
+            return [self.index_to_cust_no[n_idx] for n_idx in neighbors]
+        return neighbors[:]
+
+    def _candidate_positions(self, chromosome: List[int], customer: int, max_positions: int = 40) -> List[int]:
+        """生成插入候选位置，兼容不同编号体系并自动回退。"""
+        if max_positions is not None and max_positions <= 0:
+            max_positions = None
+
+        n = len(chromosome)
+        if n == 0:
+            return [0]
+
+        # 记录各客户在染色体中的出现位置，兼容字典结构
+        position_lookup: Dict[int, List[int]] = {}
+
+        def _extract_customer_id(gene) -> Optional[int]:
+            if isinstance(gene, dict):
+                for key in ("customer", "cust_no", "id", "idx"):
+                    value = gene.get(key)
+                    if isinstance(value, int):
+                        return value
+                return None
+            return gene if isinstance(gene, int) else None
+
+        for idx, gene in enumerate(chromosome):
+            cust_id = _extract_customer_id(gene)
+            if cust_id is None:
+                continue
+            position_lookup.setdefault(cust_id, []).append(idx)
+
+        neighbor_customers = self._neighbor_candidates(customer, limit=max_positions)
+        candidate_positions: Set[int] = set()
+
+        for neighbor in neighbor_customers:
+            for pos in position_lookup.get(neighbor, []):
+                candidate_positions.add(pos)
+                candidate_positions.add(pos + 1)
+
+        # 如果没有找到相邻节点，退化为全局扫描
+        if not candidate_positions:
+            candidate_positions.update(range(n + 1))
+
+        # 始终允许头尾插入
+        candidate_positions.add(0)
+        candidate_positions.add(n)
+
+        ordered_positions = sorted(pos for pos in candidate_positions if 0 <= pos <= n)
+        if max_positions is not None:
+            ordered_positions = ordered_positions[:max_positions]
+        return ordered_positions
+
+    def _random_choice(self, items, probabilities=None):
+        """带兼容性的随机选择，支持Python random与NumPy随机状态。"""
+        if not items:
+            raise ValueError("Cannot choose from an empty sequence")
+
+        if probabilities is not None:
+            probs = np.array(probabilities, dtype=float)
+            if probs.ndim != 1 or len(probs) != len(items):
+                raise ValueError("Probabilities must match the number of items")
+            total = probs.sum()
+            if total <= 0:
+                probabilities = None
+            else:
+                probs = probs / total
+                probabilities = probs
+
+        if probabilities is None:
+            # 简单等概率选择
+            if hasattr(self.random_state, "choice"):
+                try:
+                    return self.random_state.choice(items)
+                except TypeError:
+                    pass
+            return random.choice(list(items))
+
+        # 带权重的选择
+        if hasattr(self.random_state, "choice"):
+            try:
+                return self.random_state.choice(items, p=probabilities)
+            except TypeError:
+                pass
+
+        cumulative = np.cumsum(probabilities)
+        rnd = self.random_state.random() if hasattr(self.random_state, "random") else random.random()
+        idx = int(np.searchsorted(cumulative, rnd, side="right"))
+        idx = min(idx, len(items) - 1)
+        return items[idx]
 
     def _solution_to_metric(self, chromosome: list[int]) -> tuple[int, float]:
         """将解（染色体）转换为评估指标（车辆数，总距离）"""
@@ -195,7 +325,10 @@ class AlnsOperators:
             return chromosome[:], []
         
         k_remove = min(len(chromosome), remove_count)
-        removed_customers = self.random_state.sample(chromosome, k_remove)
+        if hasattr(self.random_state, "sample"):
+            removed_customers = self.random_state.sample(chromosome, k_remove)
+        else:
+            removed_customers = random.sample(chromosome, k_remove)
         new_chromosome = [c for c in chromosome if c not in removed_customers]
         
         return new_chromosome, removed_customers
@@ -243,7 +376,7 @@ class AlnsOperators:
         if not weighted_customers:
             weighted_customers = chromosome
             
-        removed = [self.random_state.choice(weighted_customers)]
+        removed = [self._random_choice(weighted_customers)]
         
         while len(removed) < k_remove:
             candidates = [c for c in chromosome if c not in removed]
@@ -358,7 +491,7 @@ class AlnsOperators:
             if scores:
                 sorted_candidates = sorted(scores.items(), key=lambda x: x[1])
                 top_candidates = sorted_candidates[:max(1, len(sorted_candidates) // 3)]
-                selected = self.random_state.choice([c[0] for c in top_candidates])
+                selected = self._random_choice([c[0] for c in top_candidates])
                 removed.append(selected)
             else:
                 break
@@ -445,21 +578,48 @@ class AlnsOperators:
         """
         根据客户数量动态调整局部搜索参数
         """
+        def _build_common_params(two_opt, or_opt, swap, relocate, early_stop,
+                                  two_opt_star, cross_exchange, three_opt,
+                                  vns, als, cbls, intra_cluster, inter_cluster,
+                                  num_clusters):
+            return {
+                'two_opt_max_iter': two_opt,
+                'or_opt_max_iter': or_opt,
+                'swap_max_iter': swap,
+                'relocate_max_iter': relocate,
+                '2opt_star_max_iter': two_opt_star,
+                'cross_exchange_max_iter': cross_exchange,
+                '3opt_max_iter': three_opt,
+                'vns_max_iter': vns,
+                'als_max_iter': als,
+                'cbls_max_iter': cbls,
+                'intra_cluster_iter': intra_cluster,
+                'inter_cluster_iter': inter_cluster,
+                'num_clusters': max(2, num_clusters),
+                'early_stop_threshold': early_stop
+            }
+
         if num_customers < 50:
-            return {
-                'two_opt_max_iter': 50, 'or_opt_max_iter': 40, 'swap_max_iter': 40,
-                'relocate_max_iter': 40, 'early_stop_threshold': 10
-            }
+            return _build_common_params(
+                two_opt=40, or_opt=30, swap=30, relocate=30, early_stop=8,
+                two_opt_star=25, cross_exchange=12, three_opt=15, vns=12,
+                als=40, cbls=15, intra_cluster=20, inter_cluster=8,
+                num_clusters=max(2, num_customers // 8)
+            )
         elif num_customers < 100:
-            return {
-                'two_opt_max_iter': 80, 'or_opt_max_iter': 60, 'swap_max_iter': 60,
-                'relocate_max_iter': 60, 'early_stop_threshold': 15
-            }
+            return _build_common_params(
+                two_opt=70, or_opt=55, swap=55, relocate=55, early_stop=12,
+                two_opt_star=40, cross_exchange=18, three_opt=25, vns=18,
+                als=55, cbls=20, intra_cluster=28, inter_cluster=12,
+                num_clusters=max(3, num_customers // 10)
+            )
         else:
-            return {
-                'two_opt_max_iter': 120, 'or_opt_max_iter': 90, 'swap_max_iter': 90,
-                'relocate_max_iter': 90, 'early_stop_threshold': 20
-            }
+            return _build_common_params(
+                two_opt=100, or_opt=80, swap=80, relocate=80, early_stop=18,
+                two_opt_star=55, cross_exchange=25, three_opt=35, vns=25,
+                als=70, cbls=25, intra_cluster=36, inter_cluster=16,
+                num_clusters=max(4, min(12, num_customers // 12))
+            )
 
     def two_opt_local_search(self, chromosome: list[int], max_iterations: int = None) -> list[int]:
         """
@@ -489,10 +649,9 @@ class AlnsOperators:
             
             for i in shuffled_indices:
                 customer_i = current_solution[i]
-                if customer_i >= len(self._neighbor_lists):
+                neighbor_customers = self._neighbor_candidates(customer_i)
+                if not neighbor_customers:
                     continue
-                
-                neighbor_customers = self._neighbor_lists[customer_i]
 
                 for customer_j in neighbor_customers:
                     if customer_j not in cust_to_idx:
@@ -782,17 +941,55 @@ class AlnsOperators:
         交叉交换局部搜索：交换两条不同路径中的客户段 - 字典序优化版本
         """
         current_solution = chromosome[:]
-        
-        # 解码解决方案获取路径
+
+        def _normalize_routes(routes_data):
+            """将解码结果标准化为客户索引列表的列表。"""
+            normalized = []
+            if not isinstance(routes_data, list):
+                return normalized
+
+            for route in routes_data:
+                if isinstance(route, dict):
+                    customers = None
+                    for key in ("customers", "customer_sequence", "nodes"):
+                        customers = route.get(key)
+                        if customers is not None:
+                            break
+                elif isinstance(route, (list, tuple, np.ndarray)):
+                    customers = list(route)
+                else:
+                    customers = []
+
+                if customers is None:
+                    customers = []
+
+                normalized.append([int(c) for c in customers if isinstance(c, (int, np.integer))])
+
+            return normalized
+
+        def _extract_route(route_obj):
+            if isinstance(route_obj, dict):
+                for key in ("customers", "customer_sequence", "nodes"):
+                    value = route_obj.get(key)
+                    if isinstance(value, (list, tuple, np.ndarray)):
+                        return [int(c) for c in value if isinstance(c, (int, np.integer))]
+                return []
+            if isinstance(route_obj, (list, tuple, np.ndarray)):
+                return [int(c) for c in route_obj if isinstance(c, (int, np.integer))]
+            return []
+
         try:
-            routes_result = self.decoder.decode_solution(current_solution)
-            if isinstance(routes_result, dict) and 'routes' in routes_result:
-                routes = routes_result['routes']
-            else:
-                routes = routes_result if isinstance(routes_result, list) else []
-        except:
+            decode_result = self.decoder.decode_solution(current_solution)
+        except Exception:
             return current_solution
-            
+
+        raw_routes = []
+        if isinstance(decode_result, dict):
+            raw_routes = decode_result.get('routes', [])
+        elif isinstance(decode_result, list):
+            raw_routes = decode_result
+
+        routes = _normalize_routes(raw_routes)
         if len(routes) < 2:
             return current_solution
 
@@ -800,46 +997,56 @@ class AlnsOperators:
         params = self._get_adaptive_parameters(n)
         if max_iterations is None:
             max_iterations = params['cross_exchange_max_iter']
-        
+        max_iterations = max(1, int(max_iterations))
         early_stop_threshold = params['early_stop_threshold']
         no_improvement_count = 0
 
-        # 创建 data 字典用于计算路径质心
-        data = {'coords': {i: (self.nodes[i][0], self.nodes[i][1]) for i in range(len(self.nodes))}}
+        try:
+            for _ in range(max_iterations):
+                current_metric = self._solution_to_metric(current_solution)
+                improved = False
 
-        for iteration in range(max_iterations):
-            current_metric = self._solution_to_metric(current_solution)
-            improved = False
+                route_indices = list(range(len(routes)))
+                self.random_state.shuffle(route_indices)
 
-            route_pairs = self._get_nearest_route_pairs(routes, data, k=5) # 使用辅助函数获取邻近路径对
+                for i in range(len(routes)):
+                    for j in range(i + 1, len(routes)):
+                        r1_idx, r2_idx = route_indices[i], route_indices[j]
+                        if r1_idx >= len(routes) or r2_idx >= len(routes):
+                            continue
 
-            for r1_idx, r2_idx in route_pairs:
-                route1 = routes[r1_idx]
-                route2 = routes[r2_idx]
+                        route1 = _extract_route(routes[r1_idx])
+                        route2 = _extract_route(routes[r2_idx])
+                        if not route1 or not route2:
+                            continue
 
-                if not route1 or not route2:
-                    continue
+                        for c1_idx in range(len(route1)):
+                            for c2_idx in range(len(route2)):
+                                new_route1 = route1[:c1_idx + 1] + route2[c2_idx + 1:]
+                                new_route2 = route2[:c2_idx + 1] + route1[c1_idx + 1:]
 
-                for i in range(len(route1)):
-                    for j in range(i, len(route1)):
-                        for k in range(len(route2)):
-                            for l in range(k, len(route2)):
-                                seg1 = route1[i:j+1]
-                                seg2 = route2[k:l+1]
+                                new_chromosome = []
+                                for r_idx in range(len(routes)):
+                                    if r_idx == r1_idx:
+                                        new_chromosome.extend(new_route1)
+                                    elif r_idx == r2_idx:
+                                        new_chromosome.extend(new_route2)
+                                    else:
+                                        new_chromosome.extend(_extract_route(routes[r_idx]))
 
-                                new_route1 = route1[:i] + seg2 + route1[j+1:]
-                                new_route2 = route2[:k] + seg1 + route2[l+1:]
-
-                                temp_routes = routes[:]
-                                temp_routes[r1_idx] = new_route1
-                                temp_routes[r2_idx] = new_route2
-
-                                new_chromosome = [c for r in temp_routes for c in r]
                                 new_metric = self._solution_to_metric(new_chromosome)
 
                                 if self._lex_better(new_metric, current_metric):
                                     current_solution = new_chromosome
-                                    routes = self.decoder.decode_solution(current_solution)
+                                    try:
+                                        decode_result = self.decoder.decode_solution(current_solution)
+                                    except Exception:
+                                        decode_result = None
+
+                                    if isinstance(decode_result, dict):
+                                        routes = _normalize_routes(decode_result.get('routes', []))
+                                    elif isinstance(decode_result, list):
+                                        routes = _normalize_routes(decode_result)
                                     improved = True
                                     no_improvement_count = 0
                                     break
@@ -849,15 +1056,13 @@ class AlnsOperators:
                             break
                     if improved:
                         break
-                if improved:
-                    break
-            
-            if not improved:
-                no_improvement_count += 1
-                if no_improvement_count >= early_stop_threshold:
-                    break
-            else:
-                routes = self.decoder.decode_solution(current_solution)
+
+                if not improved:
+                    no_improvement_count += 1
+                    if no_improvement_count >= early_stop_threshold:
+                        break
+        except KeyError:
+            return chromosome[:]
 
         return current_solution
 
@@ -1054,7 +1259,7 @@ class AlnsOperators:
             # --- 算子选择 ---
             total_score = sum(stat['score'] for stat in self.operator_stats.values())
             probabilities = [self.operator_stats[op.__name__]['score'] / total_score for op in operators]
-            selected_op = self.random_state.choice(operators, p=probabilities)
+            selected_op = self._random_choice(operators, probabilities)
 
             # --- 应用算子 ---
             new_solution = selected_op(current_solution, max_iterations=10) # 运行少量迭代

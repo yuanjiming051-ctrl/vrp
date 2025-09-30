@@ -41,6 +41,7 @@ class DQNALNSSolver:
                  enable_local_search: bool = True,
                  local_search_type: str = 'adaptive',
                  local_search_frequency: int = 5,
+                 local_search_top_k: int = 5,
                  verbose: bool = True,
                  distance_threshold: float = 5.0,
                  # 多样化策略参数
@@ -158,6 +159,7 @@ class DQNALNSSolver:
         self.enable_local_search = enable_local_search
         self.local_search_type = local_search_type
         self.local_search_frequency = max(1, local_search_frequency)  # 最少1轮执行一次，最大化局部搜索频率
+        self.local_search_top_k = max(1, int(local_search_top_k))
         # self.verbose = verbose  # 已在上文初始化，避免重复设置
         
         # 多样化策略参数
@@ -532,10 +534,10 @@ class DQNALNSSolver:
             
             # 应用局部搜索操作到Full空间种群
             if self.verbose:
-                print(f"  [Full LS] 对Full空间种群应用局部搜索操作...")
-            
+                print(f"  [Full LS] 对Full空间种群应用局部搜索操作 (仅最优{self.local_search_top_k}个个体)...")
+
             pop_full, pop_full_cost = self.apply_local_search_operations(
-                pop_full, pop_full_cost, max_iterations=10
+                pop_full, pop_full_cost, max_iterations=10, top_k=self.local_search_top_k
             )
             
             if self.verbose:
@@ -698,18 +700,24 @@ class DQNALNSSolver:
             # ---------------------------------------
             # 修复：使用Full空间内部迭代计数器，而不是外层轮次
             if self.enable_local_search and (full_iter_idx % self.local_search_frequency == 0):
+                num_candidates = max(1, min(self.local_search_top_k, len(pop_full)))
                 if self.verbose:
-                    print(f"[Round {round_idx}, Full迭代 {full_iter_idx+1}] 执行局部搜索...")
+                    print(
+                        f"[Round {round_idx}, Full迭代 {full_iter_idx+1}] 执行局部搜索 (仅最优{num_candidates}个个体)..."
+                    )
 
-                # 对前50%精英执行局部搜索，提升质量
-                num_to_search = max(1, (self.pop_size + 1) // 2)
-                best_indices = np.argsort(pop_full_cost)[:num_to_search]
+                # 对前若干最优个体执行局部搜索，提升质量
+                try:
+                    sorted_indices = np.argsort(pop_full_cost)
+                except Exception:
+                    sorted_indices = np.argsort(np.array(pop_full_cost, dtype=float))
+                best_indices = list(sorted_indices[:num_candidates])
 
                 for k in best_indices:
                     try:
                         # 自适应迭代次数：规模越大、迭代数越多（但上限控制在 60）
                         n_cust = len(self.instance.ordinary_customers)
-                        ls_iters = max(50, min(60, n_cust // 8))
+                        ls_iters = max(20, min(30, n_cust // 12))
 
                         # 使用 AlnsOperators 中的局部搜索方法
                         improved_solution, improved_cost = None, None
@@ -1449,7 +1457,7 @@ class DQNALNSSolver:
         
         return updated_population, updated_costs
     
-    def apply_local_search_operations(self, population, costs, space='full', max_iterations=None):
+    def apply_local_search_operations(self, population, costs, space='full', max_iterations=None, top_k=None):
         """
         对种群中的个体应用局部搜索操作
         包括：2-opt、or-opt、swap、relocate、2-opt*、cross-exchange、3-opt、VNS等
@@ -1459,13 +1467,37 @@ class DQNALNSSolver:
             costs: 种群成本列表
             space: 空间类型 ('full' 或 'deep')
             max_iterations: 最大迭代次数，如果为None则使用自适应参数
+            top_k: 仅对成本最优的前 top_k 个个体执行局部搜索（None 表示全部个体）
             
         Returns:
             improved_population: 改进后的种群列表
             improved_costs: 改进后的种群成本列表
         """
+        population_size = len(population)
+        if max_iterations is not None:
+            try:
+                max_iterations = max(1, int(max_iterations))
+            except Exception:
+                max_iterations = None
         improved_population = []
-        improved_costs = []
+        for individual in population:
+            try:
+                improved_population.append(individual.copy())
+            except AttributeError:
+                improved_population.append(list(individual))
+        improved_costs = list(costs)
+
+        if population_size == 0:
+            return improved_population, improved_costs
+
+        if top_k is None or top_k >= population_size:
+            target_indices = list(range(population_size))
+        else:
+            try:
+                sorted_indices = np.argsort(costs)
+            except Exception:
+                sorted_indices = np.argsort(np.array(costs, dtype=float))
+            target_indices = list(sorted_indices[:max(top_k, 0)])
         
         # 定义局部搜索操作列表
         local_search_ops = [
@@ -1479,9 +1511,13 @@ class DQNALNSSolver:
             self.alns_ops.variable_neighborhood_search
         ]
         
-        for i, individual in enumerate(population):
-            current_individual = individual.copy()
-            current_cost = costs[i]
+        for idx in target_indices:
+            individual = population[idx]
+            try:
+                current_individual = individual.copy()
+            except AttributeError:
+                current_individual = list(individual)
+            current_cost = costs[idx]
             
             # 对每个个体应用多种局部搜索操作
             for op in local_search_ops:
@@ -1506,9 +1542,9 @@ class DQNALNSSolver:
                         print(f"局部搜索操作 {op.__name__} 失败: {e}")
                     continue
             
-            improved_population.append(current_individual)
-            improved_costs.append(current_cost)
-        
+            improved_population[idx] = current_individual
+            improved_costs[idx] = current_cost
+
         return improved_population, improved_costs
     
     def apply_adaptive_local_search(self, population, costs, space='full'):
